@@ -1,215 +1,151 @@
-#!/usr/bin/env python
-from __future__ import print_function
-
-import tensorflow as tf
+import os
 import cv2
-import sys
-sys.path.append("game/")
-import wrapped_flappy_bird as game
+import time
 import random
 import numpy as np
 from collections import deque
+from torch.utils.tensorboard import SummaryWriter
 
-GAME = 'bird' # the name of the game being played for log files
-ACTIONS = 2 # number of valid actions
-GAMMA = 0.99 # decay rate of past observations
-OBSERVE = 100000. # timesteps to observe before training
-EXPLORE = 2000000. # frames over which to anneal epsilon
-FINAL_EPSILON = 0.0001 # final value of epsilon
-INITIAL_EPSILON = 0.0001 # starting value of epsilon
-REPLAY_MEMORY = 50000 # number of previous transitions to remember
-BATCH = 32 # size of minibatch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+# 导入 Flappy Bird 环境
+import game.wrapped_flappy_bird as game
+
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ---------------------- 超参数 ----------------------
+GAME = 'FlappyBird'
+ACTIONS = 2
+GAMMA = 0.99
+OBSERVE = 1000
+EXPLORE = 200000
+FINAL_EPSILON = 0.0001
+INITIAL_EPSILON = 0.0001
+REPLAY_MEMORY = 50000
+BATCH = 32
 FRAME_PER_ACTION = 1
+LEARNING_RATE = 1e-6
 
-def weight_variable(shape):
-    initial = tf.truncated_normal(shape, stddev = 0.01)
-    return tf.Variable(initial)
 
-def bias_variable(shape):
-    initial = tf.constant(0.01, shape = shape)
-    return tf.Variable(initial)
+# ---------------------- DQN 网络 ----------------------
+class DQN(nn.Module):
+    def __init__(self):
+        super(DQN, self).__init__()
+        self.conv1 = nn.Conv2d(4, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        self.fc1 = nn.Linear(2304, 512)
+        self.fc2 = nn.Linear(512, ACTIONS)
 
-def conv2d(x, W, stride):
-    return tf.nn.conv2d(x, W, strides = [1, stride, stride, 1], padding = "SAME")
+    def forward(self, x):
+        x = F.relu(self.conv1(x))   # [B, 32, 20, 20]
+        x = F.relu(self.conv2(x))   # [B, 64, 9, 9]
+        x = F.relu(self.conv3(x))   # [B, 64, 7, 7]
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
 
-def max_pool_2x2(x):
-    return tf.nn.max_pool(x, ksize = [1, 2, 2, 1], strides = [1, 2, 2, 1], padding = "SAME")
+# ---------------------- 图像预处理 ----------------------
+def preprocess(observation):
+    observation = cv2.cvtColor(cv2.resize(observation, (80, 80)), cv2.COLOR_BGR2GRAY)
+    _, observation = cv2.threshold(observation, 1, 255, cv2.THRESH_BINARY)
+    return np.reshape(observation, (80, 80, 1))
 
-def createNetwork():
-    # network weights
-    W_conv1 = weight_variable([8, 8, 4, 32])
-    b_conv1 = bias_variable([32])
 
-    W_conv2 = weight_variable([4, 4, 32, 64])
-    b_conv2 = bias_variable([64])
+# ---------------------- 训练主函数 ----------------------
+def train():
+    writer = SummaryWriter(log_dir=f"runs/{GAME}_dqn")
 
-    W_conv3 = weight_variable([3, 3, 64, 64])
-    b_conv3 = bias_variable([64])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = DQN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    W_fc1 = weight_variable([1600, 512])
-    b_fc1 = bias_variable([512])
-
-    W_fc2 = weight_variable([512, ACTIONS])
-    b_fc2 = bias_variable([ACTIONS])
-
-    # input layer
-    s = tf.placeholder("float", [None, 80, 80, 4])
-
-    # hidden layers
-    h_conv1 = tf.nn.relu(conv2d(s, W_conv1, 4) + b_conv1)
-    h_pool1 = max_pool_2x2(h_conv1)
-
-    h_conv2 = tf.nn.relu(conv2d(h_pool1, W_conv2, 2) + b_conv2)
-    #h_pool2 = max_pool_2x2(h_conv2)
-
-    h_conv3 = tf.nn.relu(conv2d(h_conv2, W_conv3, 1) + b_conv3)
-    #h_pool3 = max_pool_2x2(h_conv3)
-
-    #h_pool3_flat = tf.reshape(h_pool3, [-1, 256])
-    h_conv3_flat = tf.reshape(h_conv3, [-1, 1600])
-
-    h_fc1 = tf.nn.relu(tf.matmul(h_conv3_flat, W_fc1) + b_fc1)
-
-    # readout layer
-    readout = tf.matmul(h_fc1, W_fc2) + b_fc2
-
-    return s, readout, h_fc1
-
-def trainNetwork(s, readout, h_fc1, sess):
-    # define the cost function
-    a = tf.placeholder("float", [None, ACTIONS])
-    y = tf.placeholder("float", [None])
-    readout_action = tf.reduce_sum(tf.multiply(readout, a), reduction_indices=1)
-    cost = tf.reduce_mean(tf.square(y - readout_action))
-    train_step = tf.train.AdamOptimizer(1e-6).minimize(cost)
-
-    # open up a game state to communicate with emulator
     game_state = game.GameState()
-
-    # store the previous observations in replay memory
     D = deque()
 
-    # printing
-    a_file = open("logs_" + GAME + "/readout.txt", 'w')
-    h_file = open("logs_" + GAME + "/hidden.txt", 'w')
-
-    # get the first state by doing nothing and preprocess the image to 80x80x4
     do_nothing = np.zeros(ACTIONS)
     do_nothing[0] = 1
-    x_t, r_0, terminal = game_state.frame_step(do_nothing)
-    x_t = cv2.cvtColor(cv2.resize(x_t, (80, 80)), cv2.COLOR_BGR2GRAY)
-    ret, x_t = cv2.threshold(x_t,1,255,cv2.THRESH_BINARY)
-    s_t = np.stack((x_t, x_t, x_t, x_t), axis=2)
+    x_t, _, _ = game_state.frame_step(do_nothing)
+    x_t = preprocess(x_t)
+    s_t = np.concatenate([x_t] * 4, axis=2)
 
-    # saving and loading networks
-    saver = tf.train.Saver()
-    sess.run(tf.initialize_all_variables())
-    checkpoint = tf.train.get_checkpoint_state("saved_networks")
-    if checkpoint and checkpoint.model_checkpoint_path:
-        saver.restore(sess, checkpoint.model_checkpoint_path)
-        print("Successfully loaded:", checkpoint.model_checkpoint_path)
-    else:
-        print("Could not find old network weights")
-
-    # start training
     epsilon = INITIAL_EPSILON
     t = 0
-    while "flappy bird" != "angry bird":
-        # choose an action epsilon greedily
-        readout_t = readout.eval(feed_dict={s : [s_t]})[0]
+
+    if not os.path.exists("saved_models"):
+        os.makedirs("saved_models")
+
+    while True:
+        s_tensor = torch.from_numpy(s_t.transpose(2, 0, 1)).unsqueeze(0).float().to(device)
+        output = model(s_tensor)
         a_t = np.zeros([ACTIONS])
         action_index = 0
+
         if t % FRAME_PER_ACTION == 0:
             if random.random() <= epsilon:
-                print("----------Random Action----------")
                 action_index = random.randrange(ACTIONS)
-                a_t[random.randrange(ACTIONS)] = 1
+                a_t[action_index] = 1
             else:
-                action_index = np.argmax(readout_t)
+                action_index = torch.argmax(output).item()
                 a_t[action_index] = 1
         else:
-            a_t[0] = 1 # do nothing
+            a_t[0] = 1
 
-        # scale down epsilon
         if epsilon > FINAL_EPSILON and t > OBSERVE:
             epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / EXPLORE
 
-        # run the selected action and observe next state and reward
-        x_t1_colored, r_t, terminal = game_state.frame_step(a_t)
-        x_t1 = cv2.cvtColor(cv2.resize(x_t1_colored, (80, 80)), cv2.COLOR_BGR2GRAY)
-        ret, x_t1 = cv2.threshold(x_t1, 1, 255, cv2.THRESH_BINARY)
-        x_t1 = np.reshape(x_t1, (80, 80, 1))
-        #s_t1 = np.append(x_t1, s_t[:,:,1:], axis = 2)
+        x_t1, reward, terminal = game_state.frame_step(a_t)
+        x_t1 = preprocess(x_t1)
         s_t1 = np.append(x_t1, s_t[:, :, :3], axis=2)
 
-        # store the transition in D
-        D.append((s_t, a_t, r_t, s_t1, terminal))
+        D.append((s_t, a_t, reward, s_t1, terminal))
         if len(D) > REPLAY_MEMORY:
             D.popleft()
 
-        # only train if done observing
         if t > OBSERVE:
-            # sample a minibatch to train on
             minibatch = random.sample(D, BATCH)
+            s_batch = torch.tensor(np.array([d[0].transpose(2, 0, 1) for d in minibatch]), dtype=torch.float32).to(device)
+            a_batch = torch.tensor(np.array([d[1] for d in minibatch]), dtype=torch.float32).to(device)
+            r_batch = torch.tensor(np.array([d[2] for d in minibatch]), dtype=torch.float32).to(device)
+            s1_batch = torch.tensor(np.array([d[3].transpose(2, 0, 1) for d in minibatch]), dtype=torch.float32).to(device)
 
-            # get the batch variables
-            s_j_batch = [d[0] for d in minibatch]
-            a_batch = [d[1] for d in minibatch]
-            r_batch = [d[2] for d in minibatch]
-            s_j1_batch = [d[3] for d in minibatch]
+            q_values = model(s_batch)
+            q_action = torch.sum(q_values * a_batch, dim=1)
 
-            y_batch = []
-            readout_j1_batch = readout.eval(feed_dict = {s : s_j1_batch})
-            for i in range(0, len(minibatch)):
-                terminal = minibatch[i][4]
-                # if terminal, only equals reward
-                if terminal:
-                    y_batch.append(r_batch[i])
+            q_next = model(s1_batch)
+            y = []
+            for i in range(BATCH):
+                if minibatch[i][4]:
+                    y.append(r_batch[i])
                 else:
-                    y_batch.append(r_batch[i] + GAMMA * np.max(readout_j1_batch[i]))
+                    y.append(r_batch[i] + GAMMA * torch.max(q_next[i]))
+            y = torch.stack(y)
 
-            # perform gradient step
-            train_step.run(feed_dict = {
-                y : y_batch,
-                a : a_batch,
-                s : s_j_batch}
-            )
+            loss = F.mse_loss(q_action, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        # update the old values
+            # 日志记录
+            writer.add_scalar("Loss", loss.item(), t)
+            writer.add_scalar("Q_max", output.max().item(), t)
+            writer.add_scalar("Reward", reward, t)
+            writer.add_scalar("Epsilon", epsilon, t)
+
         s_t = s_t1
         t += 1
 
-        # save progress every 10000 iterations
         if t % 10000 == 0:
-            saver.save(sess, 'saved_networks/' + GAME + '-dqn', global_step = t)
+            torch.save(model.state_dict(), f"saved_models/{GAME}_dqn_{t}.pth")
 
-        # print info
-        state = ""
-        if t <= OBSERVE:
-            state = "observe"
-        elif t > OBSERVE and t <= OBSERVE + EXPLORE:
-            state = "explore"
-        else:
-            state = "train"
+        print(f"[{t}] STATE: {'observe' if t <= OBSERVE else 'train'} | EPSILON: {epsilon:.5f} | ACTION: {action_index} | REWARD: {reward} | Q_MAX: {output.max().item():.5f}")
 
-        print("TIMESTEP", t, "/ STATE", state, \
-            "/ EPSILON", epsilon, "/ ACTION", action_index, "/ REWARD", r_t, \
-            "/ Q_MAX %e" % np.max(readout_t))
-        # write info to files
-        '''
-        if t % 10000 <= 100:
-            a_file.write(",".join([str(x) for x in readout_t]) + '\n')
-            h_file.write(",".join([str(x) for x in h_fc1.eval(feed_dict={s:[s_t]})[0]]) + '\n')
-            cv2.imwrite("logs_tetris/frame" + str(t) + ".png", x_t1)
-        '''
-
-def playGame():
-    sess = tf.InteractiveSession()
-    s, readout, h_fc1 = createNetwork()
-    trainNetwork(s, readout, h_fc1, sess)
-
-def main():
-    playGame()
 
 if __name__ == "__main__":
-    main()
+    train()

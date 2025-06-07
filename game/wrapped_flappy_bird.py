@@ -2,7 +2,7 @@ import numpy as np
 import sys
 import random
 import pygame
-import flappy_bird_utils
+import game.flappy_bird_utils as flappy_bird_utils
 import pygame.surfarray as surfarray
 from pygame.locals import *
 from itertools import cycle
@@ -60,7 +60,7 @@ class GameState:
     def frame_step(self, input_actions):
         pygame.event.pump()
 
-        reward = 0.1
+        reward = 1
         terminal = False
 
         if sum(input_actions) != 1:
